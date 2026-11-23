@@ -1,0 +1,19 @@
+name: S01 shared state reader isolation
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Reproduce shared account cache aliasing
+        run: go test ./core/state -run '^TestResearchS01SharedReaderAccountIsolation$' -count=1 -v

@@ -1,0 +1,602 @@
+// Copyright 2015 The go-ethereum Authors
+// This file is part of the go-ethereum library.
+//
+// The go-ethereum library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The go-ethereum library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+
+// Package tests implements execution of Ethereum JSON tests.
+package tests
+
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	stdmath "math"
+	"math/big"
+	"os"
+	"reflect"
+	"strings"
+	"sync"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/consensus/beacon"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/types/bal"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/hashdb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
+)
+
+// RunConfig holds the execution settings for BlockTest.Run and EngineTest.Run.
+// The zero value runs blocks as the chain does by default.
+type RunConfig struct {
+	// Sequential executes every block sequentially, even one the EIP-7928
+	// parallel processor could run.
+	Sequential bool
+
+	// WithholdAccessList never attaches a block test's delivered access list,
+	// so every block executes without one. Engine tests carry the list in the
+	// payload and ignore it.
+	WithholdAccessList bool
+
+	// NoPrecompileCache turns off the precompile result cache the chain
+	// shares across a test's blocks.
+	NoPrecompileCache bool
+}
+
+// A BlockTest checks handling of entire blocks.
+type BlockTest struct {
+	json btJSON
+
+	// Rejections lists every block the chain rejected during Run, in fixture
+	// order, so a consumer can check why each was rejected.
+	Rejections []Rejection
+}
+
+// A Rejection is a test block or payload the client rejected, with the
+// client's own error.
+type Rejection struct {
+	Index int          `json:"index"`          // position in the fixture's blocks or engineNewPayloads
+	Hash  *common.Hash `json:"hash,omitempty"` // the block's hash, when the client computed one
+	Error string       `json:"error"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler interface.
+func (t *BlockTest) UnmarshalJSON(in []byte) error {
+	return json.Unmarshal(in, &t.json)
+}
+
+type btJSON struct {
+	Blocks     []btBlock             `json:"blocks"`
+	Genesis    btHeader              `json:"genesisBlockHeader"`
+	Pre        types.GenesisAlloc    `json:"pre"`
+	Post       types.GenesisAlloc    `json:"postState"`
+	BestBlock  common.UnprefixedHash `json:"lastblockhash"`
+	Network    string                `json:"network"`
+	SealEngine string                `json:"sealEngine"`
+}
+
+type btBlock struct {
+	BlockHeader     *btHeader
+	ExpectException string
+	Rlp             string
+	UncleHeaders    []*btHeader
+
+	// The EIP-7928 block access list travels beside the block, not in its RLP.
+	// Fixtures carry it as blockAccessList, or, for a block expected to be
+	// rejected, only inside rlp_decoded.
+	BlockAccessList json.RawMessage `json:"blockAccessList"`
+	RlpDecoded      *struct {
+		BlockAccessList json.RawMessage `json:"blockAccessList"`
+	} `json:"rlp_decoded"`
+}
+
+// balQuantityKeys are the access list fields holding hex quantities, which the
+// fixtures zero-pad ("0x00") and geth's hexutil decoders reject.
+var balQuantityKeys = map[string]bool{
+	"blockAccessIndex": true, "postNonce": true, "postBalance": true,
+	"postValue": true, "slot": true, "storageReads": true,
+}
+
+// trimHexQuantity strips the leading zeros from a hex quantity.
+func trimHexQuantity(v string) string {
+	if !strings.HasPrefix(v, "0x") {
+		return v
+	}
+	digits := strings.TrimLeft(v[2:], "0")
+	if digits == "" {
+		digits = "0"
+	}
+	return "0x" + digits
+}
+
+// trimBALQuantities rewrites the hex quantities in a decoded access list JSON
+// tree into the form geth's decoders accept, leaving addresses and code alone.
+func trimBALQuantities(node any, quantity bool) any {
+	switch n := node.(type) {
+	case map[string]any:
+		for k, v := range n {
+			n[k] = trimBALQuantities(v, balQuantityKeys[k])
+		}
+	case []any:
+		for i, v := range n {
+			n[i] = trimBALQuantities(v, quantity)
+		}
+	case string:
+		if quantity {
+			return trimHexQuantity(n)
+		}
+	}
+	return node
+}
+
+// accessList decodes the fixture's block access list, if it carries one.
+func (bb *btBlock) accessList() (*bal.BlockAccessList, error) {
+	raw := bb.BlockAccessList
+	if len(raw) == 0 && bb.RlpDecoded != nil {
+		raw = bb.RlpDecoded.BlockAccessList
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var tree any
+	if err := json.Unmarshal(raw, &tree); err != nil {
+		return nil, err
+	}
+	trimmed, err := json.Marshal(trimBALQuantities(tree, false))
+	if err != nil {
+		return nil, err
+	}
+	var list bal.BlockAccessList
+	if err := json.Unmarshal(trimmed, &list); err != nil {
+		return nil, err
+	}
+	return &list, nil
+}
+
+//go:generate go run github.com/fjl/gencodec -type btHeader -field-override btHeaderMarshaling -out gen_btheader.go
+
+type btHeader struct {
+	Bloom                 types.Bloom
+	Coinbase              common.Address
+	MixHash               common.Hash
+	Nonce                 types.BlockNonce
+	Number                *big.Int
+	Hash                  common.Hash
+	ParentHash            common.Hash
+	ReceiptTrie           common.Hash
+	StateRoot             common.Hash
+	TransactionsTrie      common.Hash
+	UncleHash             common.Hash
+	ExtraData             []byte
+	Difficulty            *big.Int
+	GasLimit              uint64
+	GasUsed               uint64
+	Timestamp             uint64
+	BaseFeePerGas         *big.Int
+	WithdrawalsRoot       *common.Hash
+	BlobGasUsed           *uint64
+	ExcessBlobGas         *uint64
+	ParentBeaconBlockRoot *common.Hash
+	SlotNumber            *uint64
+}
+
+type btHeaderMarshaling struct {
+	ExtraData     hexutil.Bytes
+	Number        *math.HexOrDecimal256
+	Difficulty    *math.HexOrDecimal256
+	GasLimit      math.HexOrDecimal64
+	GasUsed       math.HexOrDecimal64
+	Timestamp     math.HexOrDecimal64
+	BaseFeePerGas *math.HexOrDecimal256
+	BlobGasUsed   *math.HexOrDecimal64
+	ExcessBlobGas *math.HexOrDecimal64
+	SlotNumber    *math.HexOrDecimal64
+}
+
+func (t *BlockTest) Run(snapshotter bool, scheme string, witness bool, tracer *tracing.Hooks, cfg RunConfig, postCheck func(error, *core.BlockChain)) (result error) {
+	t.Rejections = []Rejection{}
+	config, ok := Forks[t.json.Network]
+	if !ok {
+		return UnsupportedForkError{t.json.Network}
+	}
+
+	// import pre accounts & construct test genesis block & state root
+	// Commit genesis state
+	var (
+		gspec = genesisFromHeader(config, &t.json.Genesis, t.json.Pre)
+		db    = rawdb.NewMemoryDatabase()
+		tconf = &triedb.Config{
+			Preimages: true,
+			IsPBT:     gspec.IsPBT(),
+		}
+	)
+	if scheme == rawdb.PathScheme || tconf.IsPBT {
+		tconf.PathDB = pathdb.Defaults
+	} else {
+		tconf.HashDB = hashdb.Defaults
+	}
+
+	// if ttd is not specified, set an arbitrary huge value
+	if gspec.Config.TerminalTotalDifficulty == nil {
+		gspec.Config.TerminalTotalDifficulty = big.NewInt(stdmath.MaxInt64)
+	}
+	triedb := triedb.NewDatabase(db, tconf)
+	gblock, err := gspec.Commit(db, triedb, nil)
+	if err != nil {
+		return err
+	}
+	triedb.Close() // close the db to prevent memory leak
+
+	if gblock.Hash() != t.json.Genesis.Hash {
+		return fmt.Errorf("genesis block hash doesn't match test: computed=%x, test=%x", gblock.Hash().Bytes()[:6], t.json.Genesis.Hash[:6])
+	}
+	if gblock.Root() != t.json.Genesis.StateRoot {
+		return fmt.Errorf("genesis block state root does not match test: computed=%x, test=%x", gblock.Root().Bytes()[:6], t.json.Genesis.StateRoot[:6])
+	}
+	// Wrap the original engine within the beacon-engine
+	engine := beacon.New(ethash.NewFaker())
+
+	options := &core.BlockChainConfig{
+		TrieCleanLimit: 0,
+		StateScheme:    scheme,
+		Preimages:      true,
+		TxLookupLimit:  -1, // disable tx indexing
+		VmConfig: vm.Config{
+			Tracer:                   tracer,
+			DisableParallelExecution: cfg.Sequential,
+		},
+		NoPrecompileCache:       cfg.NoPrecompileCache,
+		StatelessSelfValidation: witness,
+	}
+	if snapshotter {
+		options.SnapshotLimit = 1
+		options.SnapshotWait = true
+	}
+	chain, err := core.NewBlockChain(db, gspec, engine, options)
+	if err != nil {
+		return err
+	}
+	defer chain.Stop()
+
+	validBlocks, err := t.insertBlocks(chain, cfg.WithholdAccessList)
+	if err != nil {
+		return err
+	}
+	// Import succeeded: regardless of whether the _test_ succeeds or not, schedule
+	// the post-check to run
+	if postCheck != nil {
+		defer postCheck(result, chain)
+	}
+	cmlast := chain.CurrentBlock().Hash()
+	if common.Hash(t.json.BestBlock) != cmlast {
+		return fmt.Errorf("last block hash validation mismatch: want: %x, have: %x", t.json.BestBlock, cmlast)
+	}
+	newDB, err := chain.State()
+	if err != nil {
+		return err
+	}
+	if err = validatePostState(t.json.Post, newDB); err != nil {
+		return fmt.Errorf("post state validation failed: %v", err)
+	}
+	// Cross-check the snapshot-to-hash against the trie hash
+	if snapshotter {
+		if chain.Snapshots() != nil {
+			if err := chain.Snapshots().Verify(chain.CurrentBlock().Root); err != nil {
+				return err
+			}
+		}
+	}
+	return t.validateImportedHeaders(chain, validBlocks)
+}
+
+// Network returns the network/fork name for this test.
+func (t *BlockTest) Network() string {
+	return t.json.Network
+}
+
+// genesisFromHeader returns the genesis of a block or engine test, built from
+// its genesis block header and pre-state.
+func genesisFromHeader(config *params.ChainConfig, header *btHeader, alloc types.GenesisAlloc) *core.Genesis {
+	return &core.Genesis{
+		Config:        config,
+		Nonce:         header.Nonce.Uint64(),
+		Timestamp:     header.Timestamp,
+		ParentHash:    header.ParentHash,
+		ExtraData:     header.ExtraData,
+		GasLimit:      header.GasLimit,
+		GasUsed:       header.GasUsed,
+		Difficulty:    header.Difficulty,
+		Mixhash:       header.MixHash,
+		Coinbase:      header.Coinbase,
+		Alloc:         alloc,
+		BaseFee:       header.BaseFeePerGas,
+		BlobGasUsed:   header.BlobGasUsed,
+		ExcessBlobGas: header.ExcessBlobGas,
+		SlotNumber:    header.SlotNumber,
+	}
+}
+
+/*
+See https://ethereum-tests.readthedocs.io/en/latest/blockchain-ref.html
+
+	Whether a block is valid or not is a bit subtle, it's defined by presence of
+	blockHeader, transactions and uncleHeaders fields. If they are missing, the block is
+	invalid and we must verify that we do not accept it.
+
+	Since some tests mix valid and invalid blocks we need to check this for every block.
+
+	If a block is invalid it does not necessarily fail the test, if it's invalidness is
+	expected we are expected to ignore it and continue processing and then validate the
+	post state.
+*/
+func (t *BlockTest) insertBlocks(blockchain *core.BlockChain, withholdAccessList bool) ([]btBlock, error) {
+	validBlocks := make([]btBlock, 0)
+	// insert the test blocks, which will execute all transactions
+	for bi, b := range t.json.Blocks {
+		cb, dropped, err := b.decode(withholdAccessList)
+		if err != nil {
+			t.Rejections = append(t.Rejections, Rejection{Index: bi, Error: err.Error()})
+			if b.BlockHeader == nil {
+				log.Info("Block decoding failed", "index", bi, "err", err)
+				continue // OK - block is supposed to be invalid, continue with next block
+			} else {
+				return nil, fmt.Errorf("block RLP decoding failed when expected to succeed: %v", err)
+			}
+		}
+		// RLP decoding worked, try to insert into chain:
+		blocks := types.Blocks{cb}
+		beginImport(cb.Hash(), dropped)
+		i, err := blockchain.InsertChain(blocks)
+		endImport(cb.Hash())
+		if err != nil {
+			hash := cb.Hash()
+			t.Rejections = append(t.Rejections, Rejection{Index: bi, Hash: &hash, Error: err.Error()})
+			if b.BlockHeader == nil {
+				continue // OK - block is supposed to be invalid, continue with next block
+			} else {
+				return nil, fmt.Errorf("block #%v insertion into chain failed: %v", blocks[i].Number(), err)
+			}
+		}
+		if b.BlockHeader == nil {
+			if data, err := json.MarshalIndent(cb.Header(), "", "  "); err == nil {
+				fmt.Fprintf(os.Stderr, "block (index %d) insertion should have failed due to: %v:\n%v\n",
+					bi, b.ExpectException, string(data))
+			}
+			return nil, fmt.Errorf("block (index %d) insertion should have failed due to: %v",
+				bi, b.ExpectException)
+		}
+
+		// validate RLP decoding by checking all values against test file JSON
+		if err = validateHeader(b.BlockHeader, cb.Header()); err != nil {
+			return nil, fmt.Errorf("deserialised block header validation failed: %v", err)
+		}
+		validBlocks = append(validBlocks, b)
+	}
+	return validBlocks, nil
+}
+
+func validateHeader(h *btHeader, h2 *types.Header) error {
+	if h.Bloom != h2.Bloom {
+		return fmt.Errorf("bloom: want: %x have: %x", h.Bloom, h2.Bloom)
+	}
+	if h.Coinbase != h2.Coinbase {
+		return fmt.Errorf("coinbase: want: %x have: %x", h.Coinbase, h2.Coinbase)
+	}
+	if h.MixHash != h2.MixDigest {
+		return fmt.Errorf("MixHash: want: %x have: %x", h.MixHash, h2.MixDigest)
+	}
+	if h.Nonce != h2.Nonce {
+		return fmt.Errorf("nonce: want: %x have: %x", h.Nonce, h2.Nonce)
+	}
+	if h.Number.Cmp(h2.Number) != 0 {
+		return fmt.Errorf("number: want: %v have: %v", h.Number, h2.Number)
+	}
+	if h.ParentHash != h2.ParentHash {
+		return fmt.Errorf("parent hash: want: %x have: %x", h.ParentHash, h2.ParentHash)
+	}
+	if h.ReceiptTrie != h2.ReceiptHash {
+		return fmt.Errorf("receipt hash: want: %x have: %x", h.ReceiptTrie, h2.ReceiptHash)
+	}
+	if h.TransactionsTrie != h2.TxHash {
+		return fmt.Errorf("tx hash: want: %x have: %x", h.TransactionsTrie, h2.TxHash)
+	}
+	if h.StateRoot != h2.Root {
+		return fmt.Errorf("state hash: want: %x have: %x", h.StateRoot, h2.Root)
+	}
+	if h.UncleHash != h2.UncleHash {
+		return fmt.Errorf("uncle hash: want: %x have: %x", h.UncleHash, h2.UncleHash)
+	}
+	if !bytes.Equal(h.ExtraData, h2.Extra) {
+		return fmt.Errorf("extra data: want: %x have: %x", h.ExtraData, h2.Extra)
+	}
+	if h.Difficulty.Cmp(h2.Difficulty) != 0 {
+		return fmt.Errorf("difficulty: want: %v have: %v", h.Difficulty, h2.Difficulty)
+	}
+	if h.GasLimit != h2.GasLimit {
+		return fmt.Errorf("gasLimit: want: %d have: %d", h.GasLimit, h2.GasLimit)
+	}
+	if h.GasUsed != h2.GasUsed {
+		return fmt.Errorf("gasUsed: want: %d have: %d", h.GasUsed, h2.GasUsed)
+	}
+	if h.Timestamp != h2.Time {
+		return fmt.Errorf("timestamp: want: %v have: %v", h.Timestamp, h2.Time)
+	}
+	// Optional post-London field: nil means "absent" (pre-London) and must not
+	// Cmp, which panics on a nil receiver. JSON "0x0" and RLP-decoded 0 are
+	// numerically equal but not DeepEqual (abs nil vs non-nil).
+	if (h.BaseFeePerGas == nil) != (h2.BaseFee == nil) {
+		return fmt.Errorf("baseFeePerGas: want: %v have: %v", h.BaseFeePerGas, h2.BaseFee)
+	}
+	if h.BaseFeePerGas != nil && h.BaseFeePerGas.Cmp(h2.BaseFee) != 0 {
+		return fmt.Errorf("baseFeePerGas: want: %v have: %v", h.BaseFeePerGas, h2.BaseFee)
+	}
+	if !reflect.DeepEqual(h.WithdrawalsRoot, h2.WithdrawalsHash) {
+		return fmt.Errorf("withdrawalsRoot: want: %v have: %v", h.WithdrawalsRoot, h2.WithdrawalsHash)
+	}
+	if !reflect.DeepEqual(h.BlobGasUsed, h2.BlobGasUsed) {
+		return fmt.Errorf("blobGasUsed: want: %v have: %v", h.BlobGasUsed, h2.BlobGasUsed)
+	}
+	if !reflect.DeepEqual(h.ExcessBlobGas, h2.ExcessBlobGas) {
+		return fmt.Errorf("excessBlobGas: want: %v have: %v", h.ExcessBlobGas, h2.ExcessBlobGas)
+	}
+	if !reflect.DeepEqual(h.ParentBeaconBlockRoot, h2.ParentBeaconRoot) {
+		return fmt.Errorf("parentBeaconBlockRoot: want: %v have: %v", h.ParentBeaconBlockRoot, h2.ParentBeaconRoot)
+	}
+	if !reflect.DeepEqual(h.SlotNumber, h2.SlotNumber) {
+		return fmt.Errorf("slotNumber: want: %v have: %v", h.SlotNumber, h2.SlotNumber)
+	}
+	return nil
+}
+
+// validatePostState checks the accounts of a test's expected post-state
+// against the state database.
+func validatePostState(post types.GenesisAlloc, statedb *state.StateDB) error {
+	for addr, acct := range post {
+		// address is indirectly verified by the other fields, as it's the db key
+		code2 := statedb.GetCode(addr)
+		balance2 := statedb.GetBalance(addr).ToBig()
+		nonce2 := statedb.GetNonce(addr)
+		if !bytes.Equal(code2, acct.Code) {
+			return fmt.Errorf("account code mismatch for addr: %s want: %v have: %s", addr, acct.Code, hex.EncodeToString(code2))
+		}
+		if balance2.Cmp(acct.Balance) != 0 {
+			return fmt.Errorf("account balance mismatch for addr: %s, want: %d, have: %d", addr, acct.Balance, balance2)
+		}
+		if nonce2 != acct.Nonce {
+			return fmt.Errorf("account nonce mismatch for addr: %s want: %d have: %d", addr, acct.Nonce, nonce2)
+		}
+		for k, v := range acct.Storage {
+			v2 := statedb.GetState(addr, k)
+			if v2 != v {
+				return fmt.Errorf("account storage mismatch for addr: %s, slot: %x, want: %x, have: %x", addr, k, v, v2)
+			}
+		}
+	}
+	return nil
+}
+
+func (t *BlockTest) validateImportedHeaders(cm *core.BlockChain, validBlocks []btBlock) error {
+	// to get constant lookup when verifying block headers by hash (some tests have many blocks)
+	bmap := make(map[common.Hash]btBlock, len(t.json.Blocks))
+	for _, b := range validBlocks {
+		bmap[b.BlockHeader.Hash] = b
+	}
+	// iterate over blocks backwards from HEAD and validate imported
+	// headers vs test file. some tests have reorgs, and we import
+	// block-by-block, so we can only validate imported headers after
+	// all blocks have been processed by BlockChain, as they may not
+	// be part of the longest chain until last block is imported.
+	for b := cm.CurrentBlock(); b != nil && b.Number.Uint64() != 0; b = cm.GetBlockByHash(b.ParentHash).Header() {
+		if err := validateHeader(bmap[b.Hash()].BlockHeader, b); err != nil {
+			return fmt.Errorf("imported block header validation failed: %v", err)
+		}
+	}
+	return nil
+}
+
+// decode returns the fixture block, with its delivered access list attached
+// when that list is the one the header commits to, and whether a delivered
+// list was dropped. With withholdAccessList, no list is ever attached, and a
+// delivered one counts as dropped.
+func (bb *btBlock) decode(withholdAccessList bool) (*types.Block, bool, error) {
+	data, err := hexutil.Decode(bb.Rlp)
+	if err != nil {
+		return nil, false, err
+	}
+	var b types.Block
+	if err = rlp.DecodeBytes(data, &b); err != nil {
+		return nil, false, err
+	}
+	list, err := bb.accessList()
+	if withholdAccessList {
+		return &b, list != nil || err != nil, nil
+	}
+	// The access list is delivered beside the block, as it is from a peer in
+	// sync, so it is used only if it is the one the header commits to.
+	// Otherwise it is dropped, like the downloader drops a peer's list, and
+	// the block is judged on its header with the list computed in execution.
+	h := b.BlockAccessListHash()
+	switch {
+	case err != nil:
+		log.Debug("Dropped block access list", "number", b.NumberU64(), "hash", b.Hash(), "err", err)
+	case list == nil:
+	case h == nil || list.Hash() != *h:
+		log.Debug("Dropped block access list", "number", b.NumberU64(), "hash", b.Hash(), "err", "hash mismatch")
+	default:
+		return b.WithAccessListUnsafe(list), false, nil
+	}
+	return &b, list != nil || err != nil, nil
+}
+
+// imports tracks the blocks being inserted by every running block test, so a
+// block's execution can be tied to the import that dropped its delivered access
+// list. Core logs a block's execution by hash alone, and fixtures run in
+// parallel can import the same block, with and without a valid list, so only
+// one import of a given hash runs at a time. Only evm --bal-report reads it,
+// and only evm --workers runs fixtures in parallel.
+var imports = struct {
+	lock     sync.Mutex
+	inFlight map[common.Hash]chan struct{}
+	dropped  map[common.Hash]bool
+}{
+	inFlight: make(map[common.Hash]chan struct{}),
+	dropped:  make(map[common.Hash]bool),
+}
+
+// beginImport waits until no other import of the block is in flight, then
+// records whether this one dropped the block's delivered access list.
+func beginImport(hash common.Hash, dropped bool) {
+	imports.lock.Lock()
+	defer imports.lock.Unlock()
+	for {
+		done, busy := imports.inFlight[hash]
+		if !busy {
+			break
+		}
+		imports.lock.Unlock()
+		<-done
+		imports.lock.Lock()
+	}
+	imports.inFlight[hash] = make(chan struct{})
+	imports.dropped[hash] = dropped
+}
+
+// endImport releases the block for the next import of it.
+func endImport(hash common.Hash) {
+	imports.lock.Lock()
+	defer imports.lock.Unlock()
+	close(imports.inFlight[hash])
+	delete(imports.inFlight, hash)
+	delete(imports.dropped, hash)
+}
+
+// AccessListDropped reports whether the block with the given hash is being
+// imported by a block test that dropped its delivered access list.
+func AccessListDropped(hash common.Hash) bool {
+	imports.lock.Lock()
+	defer imports.lock.Unlock()
+	return imports.dropped[hash]
+}
