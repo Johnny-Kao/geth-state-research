@@ -1,19 +1,69 @@
-name: S01 shared state reader isolation
+name: S01 full validation
 
 on:
   push:
-    branches: [master]
+    branches: [research/s01-cache-isolation]
   workflow_dispatch:
 
 jobs:
-  repro:
+  targeted:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: Reproduce shared account cache aliasing
-        run: go test ./core/state -run '^TestResearchS01SharedReaderAccountIsolation$' -count=1 -v
+      - name: Research isolation and concurrency tests
+        run: go test ./core/state -run '^TestResearchS01' -count=20 -v
+      - name: Race detector
+        run: go test -race ./core/state -run '^TestResearchS01' -count=5
+      - name: Package tests
+        run: go test ./core/state ./core/types ./trie/... ./triedb/... -count=1
+      - name: Allocation and throughput benchmark
+        run: go test ./core/state -run '^$' -bench '^BenchmarkResearchS01AccountCacheHit$' -benchmem -benchtime=2s
+
+  upstream-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Full upstream test suite
+        run: go run ./build/ci.go test
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build all Geth commands
+        run: make all
+
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Gofmt
+        run: test -z "$(gofmt -l core/state/reader.go core/state/reader_cache_research_test.go)"
+      - name: Lint
+        run: go run ./build/ci.go lint
+      - name: Generated code
+        run: go run ./build/ci.go check_generate
+      - name: Dependency hygiene
+        run: go run ./build/ci.go check_baddeps
