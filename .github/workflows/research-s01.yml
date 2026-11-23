@@ -24,6 +24,26 @@ jobs:
       - name: Allocation and throughput benchmark
         run: go test ./core/state -run '^$' -bench '^BenchmarkResearchS01AccountCacheHit$' -benchmem -benchtime=2s
 
+  compare-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Benchmark fixed implementation
+        run: go test ./core/state -run '^$' -bench '^BenchmarkResearchS01AccountCacheHit$' -benchmem -benchtime=4s -count=3
+      - name: Restore upstream baseline cache implementation only
+        run: git show origin/master:core/state/reader.go > core/state/reader.go
+      - name: Benchmark upstream baseline on same runner
+        run: go test ./core/state -run '^$' -bench '^BenchmarkResearchS01AccountCacheHit$' -benchmem -benchtime=4s -count=3
+      - name: Show source difference
+        run: git diff --stat
+
   upstream-suite:
     runs-on: ubuntu-24.04
     timeout-minutes: 330
