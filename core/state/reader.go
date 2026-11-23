@@ -394,6 +394,9 @@ func (r *stateReaderWithCache) account(addr common.Address) (*types.StateAccount
 	acct, ok := bucket.accounts[addr]
 	bucket.lock.RUnlock()
 	if ok {
+		if acct != nil {
+			acct = acct.Copy()
+		}
 		return acct, true, nil
 	}
 	// Try to resolve the requested account from the underlying reader
@@ -402,7 +405,11 @@ func (r *stateReaderWithCache) account(addr common.Address) (*types.StateAccount
 		return nil, false, err
 	}
 	bucket.lock.Lock()
-	bucket.accounts[addr] = acct
+	if acct == nil {
+		bucket.accounts[addr] = nil
+	} else {
+		bucket.accounts[addr] = acct.Copy()
+	}
 	bucket.lock.Unlock()
 	return acct, false, nil
 }
