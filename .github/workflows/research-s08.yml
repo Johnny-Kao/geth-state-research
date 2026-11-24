@@ -1,0 +1,25 @@
+name: S08 parallel StateDB logs
+
+on:
+  push:
+    branches: [research/s08-parallel-statedb-logs]
+  workflow_dispatch:
+
+jobs:
+  targeted:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Regression test
+        run: go test ./core -run '^TestResearchParallelStateDBLogsMatchSequential$' -count=50 -v
+      - name: Race detector
+        run: go test -race ./core -run '^TestResearchParallelStateDBLogsMatchSequential$' -count=10
+      - name: Core packages
+        run: go test ./core ./core/state -count=1
+      - name: Formatting
+        run: test -z "$(gofmt -l core/state/statedb.go core/state_processor_parallel.go core/parallel_logs_research_test.go)"
