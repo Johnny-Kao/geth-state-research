@@ -1,0 +1,61 @@
+name: S07 isolated historical reader stress
+
+on:
+  push:
+    branches: [research/s03-s07-gc]
+  workflow_dispatch:
+
+jobs:
+  stale-layer-retry:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Repeat stale disk layer retry in fresh test processes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            echo "iteration=$i"
+            go test ./triedb/pathdb -run '^TestHistoricalStateReaderStaleDiskLayerRetry$' -count=1 -timeout=90s
+          done
+
+  pending-writes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Repeat pending write historical reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            echo "iteration=$i"
+            go test ./triedb/pathdb -run '^TestHistoricalStateReaderPendingWrites$' -count=1 -timeout=90s
+          done
+
+  baseline-reader:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Repeat ordinary historical reader
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            echo "iteration=$i"
+            go test ./triedb/pathdb -run '^TestHistoricalStateReader$' -count=1 -timeout=90s
+          done
