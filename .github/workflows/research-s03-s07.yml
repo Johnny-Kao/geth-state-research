@@ -1,0 +1,83 @@
+name: S03-S07 Geth research scan
+
+on:
+  push:
+    branches: [research/s03-s07-gc]
+  workflow_dispatch:
+
+jobs:
+  s03-history-pruning:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Repeated pruning and rollback invariants
+        run: go test ./triedb/pathdb -run '^(TestPrunePreservesReadability|TestPrunePauseResume|TestDatabaseRollback|TestTailTruncateHistory|TestDatabaseIndexRecovery)$' -count=20
+      - name: Race check
+        run: go test -race ./triedb/pathdb -run '^(TestPrunePreservesReadability|TestPrunePauseResume|TestDatabaseRollback|TestTailTruncateHistory|TestDatabaseIndexRecovery)$' -count=3
+
+  s04-receipt-log-index:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Canonical receipt and log reorg invariants
+        run: go test ./core -run '^(TestLogReorgs|TestLogRebirth|TestSideLogRebirth|TestGetCanonicalReceipt)$' -count=20
+      - name: Filtermap log index invariants
+        run: go test ./core/filtermaps -run '^(TestLogsByIndex|TestLogIteratorUpdateChainViewShortened)$' -count=20
+      - name: Receipt storage invariants
+        run: go test ./core/rawdb -run '^(TestBlockReceiptStorage|TestReadLogs|TestDeriveLogFields|TestExtractReceiptFields)$' -count=20
+      - name: Race check
+        run: go test -race ./core/filtermaps -run '^(TestLogsByIndex|TestLogIteratorUpdateChainViewShortened)$' -count=3
+
+  s05-failed-execution-isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Failed execution revert invariants
+        run: go test ./core -run '^(TestDeleteCreateRevert|TestEIP2780RuntimeOOGRevertsDelegations)$' -count=30
+      - name: VM failed-child state invariants
+        run: go test ./core/vm -run '^(TestCallChildRevertRefill|TestCreateInitRevertRefill|TestAbsorbFailedChildKeepsDebt)$' -count=30
+      - name: Race check
+        run: go test -race ./core -run '^(TestDeleteCreateRevert|TestEIP2780RuntimeOOGRevertsDelegations)$' -count=3
+
+  s06-snap-interruption-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Snap v2 interruption and recovery invariants
+        run: go test ./eth/protocols/snap -run '^(TestInterruptedDownloadRecovery|TestSyncPersistsPivotDuringDownload|TestCompletedSyncResumesBeforeCommit|TestInterruptedGenerationRecovery|TestResumeWipesUncoveredState|TestSyncDetectsPivotReorged)$' -count=10
+      - name: Race check
+        run: go test -race ./eth/protocols/snap -run '^(TestInterruptedDownloadRecovery|TestInterruptedGenerationRecovery|TestResumeWipesUncoveredState)$' -count=2
+
+  s07-archive-history-read:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Historical state reader invariants
+        run: go test ./triedb/pathdb -run '^(TestHistoryReader|TestHistoricalStateReader|TestHistoricalStateReaderPendingWrites|TestHistoricalStateReaderStaleDiskLayerRetry)$' -count=20
+      - name: Race check
+        run: go test -race ./triedb/pathdb -run '^(TestHistoricalStateReader|TestHistoricalStateReaderPendingWrites|TestHistoricalStateReaderStaleDiskLayerRetry)$' -count=3
