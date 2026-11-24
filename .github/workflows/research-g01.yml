@@ -1,0 +1,19 @@
+name: G01 engine range research
+
+on:
+  push:
+    branches: [research/g01-engine-range]
+  workflow_dispatch:
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify overflow range semantics
+        run: go test ./eth/catalyst -run '^TestResearchG01PayloadBodiesOverflowRange$' -count=1 -v
