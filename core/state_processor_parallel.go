@@ -337,6 +337,7 @@ func (p *StateProcessor) processParallel(ctx context.Context, block *types.Block
 	// on them, so there should be nothing left to wait for.
 	pipeline.joinReceipts()
 
+	statedb.AddLogs(allLogs)
 	statedb.AddPreimages(preState.Preimages())
 	for i := range exec.results {
 		statedb.AddPreimages(exec.results[i].preimages)

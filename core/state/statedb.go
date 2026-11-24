@@ -258,6 +258,16 @@ func (s *StateDB) AddLog(log *types.Log) {
 	s.logSize++
 }
 
+// AddLogs adopts logs recorded by ephemeral states, e.g. per-transaction states
+// used by parallel block execution. The log objects are taken as-is, so callers
+// must not retain or mutate them afterwards.
+func (s *StateDB) AddLogs(logs []*types.Log) {
+	for _, log := range logs {
+		s.logs[log.TxHash] = append(s.logs[log.TxHash], log)
+	}
+	s.logSize += uint(len(logs))
+}
+
 // GetLogs returns the logs matching the specified transaction hash, and annotates
 // them with the given blockNumber and blockHash.
 func (s *StateDB) GetLogs(hash common.Hash, blockNumber uint64, blockHash common.Hash, blockTime uint64) []*types.Log {
